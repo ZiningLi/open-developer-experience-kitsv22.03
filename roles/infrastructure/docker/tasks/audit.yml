@@ -6,17 +6,22 @@
 - name: find docker audit files
   stat:
     path: "{{ item }}"
-  loop: "{{ _docker_audit_files }}"
+  with_items: "{{ _docker_audit_files }}"
   register: stats
 
 - name: add audit rules for docker
   lineinfile:
     path: /etc/audit/rules.d/docker.rules
     line: "-w {{ item.item }} -k docker"
-    mode: a=rw
+    mode: 0666
     create: true
-  become: yes
+  become: true
   when: item.stat.exists
-  loop: "{{ stats.results }}"
-  notify:
-    - restart auditd
+  with_items: "{{ stats.results }}"
+
+- name: restart auditd
+  command: service auditd restart
+  become: true
+  changed_when: true
+  args:
+    warn: false

@@ -2,8 +2,6 @@
 # Copyright (c) 2020 Intel Corporation
 
 ---
-- name: flush handlers
-  meta: flush_handlers
 
 - name: reboot if requested
   block:
@@ -12,7 +10,7 @@
       msg: "Performing reboot"
   - name: reboot the machine
     reboot:
-    become: yes
+    become: true
   when: perform_reboot is defined
 
 - name: get current kernel version and cmdline string after reboot

@@ -12,15 +12,15 @@
 - name: set /etc/environment proxy settings
   lineinfile:
     path: /etc/environment
-    state: "{{ 'present' if item.value | length > 0 else 'absent' }}"
+    state: present
     regexp: '^{{ item.key }}'
     line: '{{ item.key }}={{ item.value }}'
     create: true
     owner: root
     group: root
-    mode: a=r,u+w
+    mode: 0644
   with_dict: "{{ proxy_env | default({}) }}"
-  become: yes
+  become: true
   when: >
     "http_proxy" in proxy_env or
     "https_proxy" in proxy_env or

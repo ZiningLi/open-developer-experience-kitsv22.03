@@ -31,5 +31,5 @@
 - name: fail if requested CNI is not available
   fail:
     msg: "Requested CNI is not available: {{ item }}"
-  loop: "{{ kubernetes_cnis }}"
+  with_items: "{{ kubernetes_cnis }}"
   when: "item not in defaults._available_kubernetes_cnis"

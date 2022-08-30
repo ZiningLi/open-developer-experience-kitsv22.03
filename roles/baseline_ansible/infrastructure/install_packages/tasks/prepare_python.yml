@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2021-2022 Intel Corporation
+# Copyright (c) 2021 Intel Corporation
 
 ---
 - name: Get python_interpreter
@@ -12,7 +12,7 @@
     install_dependencies: "{{ os_python_packages[python_interpreter] }}"
 
 - name: Set python to python3
-  become: yes
+  become: true
   alternatives:
     name: python
     path: /usr/bin/python3
@@ -20,25 +20,16 @@
   when:
     - python_interpreter == 'python3'
 
-- name: Get pip_version
-  set_fact: pip_version="{{ pip3_version if ansible_python.version.major == 3 else pip2_version }}"
-
-- name: Get python_wheel_version
-  set_fact: python_wheel_version="{{ python3_wheel_version if ansible_python.version.major == 3 else python2_wheel_version }}"
-
-- name: Get python_setuptools_version
-  set_fact: python_setuptools_version="{{ python3_setuptools_version if ansible_python.version.major == 3 else python2_setuptools_version }}"
-
 - name: update pip to specified version
-  become: yes
+  become: true
   pip:
     name: pip
     version: "{{ pip_version }}"
 
 - name: upgrade Python wheel and setuptools
+  become: true
   pip:
     name:
       - "wheel=={{ python_wheel_version }}"
       - "setuptools=={{ python_setuptools_version }}"
-    state: forcereinstall
-    extra_args: --user
+    extra_args: --upgrade

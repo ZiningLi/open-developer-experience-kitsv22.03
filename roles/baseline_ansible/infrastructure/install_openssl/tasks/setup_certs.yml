@@ -5,8 +5,8 @@
   file:
     path: "{{ item.openssl_dir }}"
     state: absent
-  become: yes
-  loop: "{{ openssl_certs_mapping | default([]) }}"
+  become: true
+  with_items: "{{ openssl_certs_mapping | default([]) }}"
 
 - name: Create a symbolic link
   file:
@@ -14,7 +14,7 @@
     dest: "{{ item.openssl_dir }}"
     owner: "{{ project_user }}"
     group: "{{ project_group }}"
-    mode: a=rx,u+w
+    mode: 0755
     state: link
-  become: yes
-  loop: "{{ openssl_certs_mapping | default([]) }}"
+  become: true
+  with_items: "{{ openssl_certs_mapping | default([]) }}"

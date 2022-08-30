@@ -14,8 +14,8 @@
       state: directory
       owner: "{{ project_user }}"
       group: "{{ project_group }}"
-      mode: a=rx,u+w
-    become: yes
+      mode: 0755
+    become: true
 
   - name: template SriovNetworkNodePolicy for operator
     template:
@@ -23,14 +23,15 @@
       dest: "{{ _sriov_network_config_dir }}/{{ item.name }}-sriov_network_node_policy.yml"
       force: true
       mode: preserve
-    loop: "{{ sriov_network_node_policies }}"
+    with_items: "{{ sriov_network_node_policies }}"
 
   - name: Create namespaces for SriovNetworks if specified
     include_role:
       name: kubernetes/custom_namespace
     vars:
-      - _custom_ns: "{{ sriov_networks | default([]) | map(attribute='network_namespace') | unique | list }}"
+      - _custom_ns: "{{ sriov_network_namespaces }}"
     when:
+      - sriov_network_namespaces|length > 0
       - sriov_networks|length > 0
 
   - name: template SriovNetwork for operator
@@ -39,7 +40,7 @@
       dest: "{{ _sriov_network_config_dir }}/{{ item.name }}-sriov_network.yml"
       force: true
       mode: preserve
-    loop: "{{ sriov_networks }}"
+    with_items: "{{ sriov_networks }}"
 
   - name: apply sriov network configuration
     command: kubectl apply -f  ./

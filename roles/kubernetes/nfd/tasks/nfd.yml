@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2019-2022 Intel Corporation
+# Copyright (c) 2019-2021 Intel Corporation
 
 ---
 - name: check if NFD release already exists
@@ -15,6 +15,7 @@
         name: "{{ _nfd_image_name }}"
         tag: "{{ _nfd_tag }}"
         source: pull
+      when: not (offline_enable | default(false))
       register: result
       retries: "{{ number_of_retries }}"
       until: result is succeeded
@@ -37,16 +38,22 @@
         state: absent
         name: "{{ _nfd_image_name }}"
         tag: "{{ _nfd_tag }}"
+      when: not (offline_enable | default(false))
 
     - name: create NFD chart template directory
       file:
         name: "{{ item }}"
         state: directory
-        mode: a=rx,u+w
-      loop:
+        mode: 0755
+      with_items:
         - "{{ _nfd_chart_dir }}"
         - "{{ _nfd_chart_dir }}/templates"
       changed_when: true
+
+    - name: reset _nfd_chart_url for offline mode
+      set_fact:
+        _nfd_chart_url: "https://{{ hostvars[groups['controller_group'][0]]['ansible_host'] }}/nfd"
+      when: offline_enable | default(false)
 
     - name: download NFD chart
       get_url:
@@ -56,7 +63,7 @@
       retries: "{{ number_of_retries }}"
       until: result is succeeded
       delay: "{{ retry_delay }}"
-      loop: "{{ _nfd_chart }}"
+      with_items: "{{ _nfd_chart }}"
 
     - name: download NFD chart templates
       get_url:
@@ -66,30 +73,7 @@
       retries: "{{ number_of_retries }}"
       until: result is succeeded
       delay: "{{ retry_delay }}"
-      loop: "{{ _nfd_chart_templates }}"
-
-    - name: customize NFD chart templates
-      block:
-        - name: install patch utility
-          package:
-            name: patch
-            state: present
-          become: true
-        - name: patch NFD ClusterRole
-          patch:
-            src: "nfd-clusterrole.yaml.patch"
-            dest: "{{ _nfd_chart_dir }}/templates/clusterrole.yaml"
-            strip: 1
-        - name: patch NFD master deployment
-          patch:
-            src: "nfd-master.yaml.patch"
-            dest: "{{ _nfd_chart_dir }}/templates/master.yaml"
-            strip: 1
-        - name: patch NFD values
-          patch:
-            src: "nfd-values.yaml.patch"
-            dest: "{{ _nfd_chart_dir }}/values.yaml"
-            strip: 1
+      with_items: "{{ _nfd_chart_templates }}"
 
     # smartedge-system namespace should already exist
     - name: create system namespace if needed
@@ -102,22 +86,10 @@
           command: kubectl create namespace {{ system_namespace }}
           when: get_system_ns.rc == 1
 
-    - name: create NFD network policy
-      template:
-        src: nfd-network-policy.yaml.j2
-        dest: "{{ _nfd_chart_dir }}/nfd-network-policy.yaml"
-        mode: preserve
-
-    - name: apply NFD network policy
-      command: kubectl apply -f "{{ _nfd_chart_dir }}/nfd-network-policy.yaml"
-      changed_when: true
-
     - name: deploy NFD with Helm chart
       command: >
         helm install {{ _nfd_release_name }} {{ _nfd_chart_dir }} \
         --set image.repository={{ _registry_ip_address }}:{{ _registry_port }}/intel/node-feature-discovery \
-        --set image.tag={{ _nfd_tag }} --set serviceAccount.name=nfd-master \
-        --set master.extraLabelNs=sgx.intel.com \
-        --namespace={{ system_namespace }}
+        --set image.tag={{ _nfd_tag }} --set serviceAccount.name=nfd-master --namespace={{ system_namespace }}
       changed_when: true
   when: get_release_nfd.rc != 0

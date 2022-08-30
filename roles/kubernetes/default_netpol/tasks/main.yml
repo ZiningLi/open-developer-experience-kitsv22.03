@@ -2,27 +2,18 @@
 # Copyright (c) 2021 Intel Corporation
 
 ---
-- name: create default network policies
+- name: create default network policy block all ingress
   block:
     - name: create temp dir
       tempfile:
         state: directory
         suffix: -default-net-pol
       register: tmp_dir
-
-    - name: create default smart edge network policies
-      template:
-        src: "{{ item }}"
-        dest: "{{ tmp_dir.path }}/{{ item | basename | regex_replace('\\.j2$', '') }}"
-        mode: preserve
-      with_fileglob: "../templates/*.j2"
-
-    - name: copy default network policy
+    - name: copy network policy file to remote
       copy:
-        src: default-network-policy.yaml
-        dest: "{{ tmp_dir.path }}/default-network-policy.yaml"
+        src: default-network-policy-block-ingress.yaml
+        dest: "{{ tmp_dir.path }}/default-network-policy-block-ingress.yaml"
         mode: preserve
-
-    - name: apply default network policies
-      command: kubectl apply -f "{{ tmp_dir.path }}"
+    - name: apply default network policy
+      command: kubectl apply -f {{ tmp_dir.path }}/default-network-policy-block-ingress.yaml
       changed_when: true

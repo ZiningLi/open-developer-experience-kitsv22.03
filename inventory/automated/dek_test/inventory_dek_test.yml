@@ -1,0 +1,16 @@
+all:
+  vars:
+    cluster_name: dek_test
+    deployment: dek
+    limit: null
+    single_node_deployment: false
+controller_group:
+  hosts:
+    controller:
+      ansible_host: 10.67.127.135
+      ansible_user: smartedge-open
+edgenode_group:
+  hosts:
+    node01:
+      ansible_host: 10.67.127.26
+      ansible_user: smartedge-open

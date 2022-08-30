@@ -6,11 +6,11 @@
   group:
     name: docker
     state: present
-  become: yes
+  become: true
 
 - name: Add current user to docker group
   user:
     name: "{{ ansible_user }}"
     groups: "docker,{{ project_group }}"
     append: true
-  become: yes
+  become: true

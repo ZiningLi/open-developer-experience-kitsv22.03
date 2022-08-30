@@ -9,12 +9,12 @@
   file:
     path: "{{ _kubernetes_config_dir }}"
     state: directory
-    mode: a=rx,u+w
-  become: yes
+    mode: 0777
+  become: true
 
 - name: create kubelet init config from template
   template:
     src: config.yaml.j2
     dest: "{{ _kubernetes_config_file }}"
-    mode: a=,u=rw
-  become: yes
+    mode: 0600
+  become: true

@@ -1,0 +1,14 @@
+2022-08-29 17:57:18.614 INFO: dek_test network_edge.yml: command: "/home/smartedge-open/.local/share/virtualenvs/open-developer-experience-kits-jf42Ff2m/bin/ansible-playbook -vv /home/smartedge-open/open-developer-experience-kits/network_edge.yml --inventory /home/smartedge-open/open-developer-experience-kits/inventory/automated/dek_test/inventory_dek_test.yml"
+2022-08-29 17:57:18.614 INFO: dek_test network_edge.yml: log file: "/home/smartedge-open/open-developer-experience-kits/logs/dek_test_dek_2022-08-29_17-57-18_network_edge.yml.log"
+2022-08-29 17:57:23.619 INFO: Only one cluster is being deployed. Redirecting logs to stdout.
+2022-08-29 17:57:23.625 INFO: <Command '/usr/bin/tail -n 100000 -f /home/smartedge-open/open-developer-experience-kits/logs/dek_test_dek_2022-08-29_17-57-18_network_edge.yml.log', pid 293774>: process started
+2022-08-29 17:59:21.725 ERROR: dek_test network_edge.yml: failed. Please check the logs: /home/smartedge-open/open-developer-experience-kits/logs/dek_test_dek_2022-08-29_17-57-18_network_edge.yml.log
+2022-08-29 17:59:22.726 INFO: ====================
+2022-08-29 17:59:22.726 INFO: DEPLOYMENT RECAP:
+2022-08-29 17:59:22.726 INFO: ====================
+2022-08-29 17:59:22.727 INFO: DEPLOYMENT COUNT: 1
+2022-08-29 17:59:22.727 INFO: SUCCESSFUL DEPLOYMENTS: 0
+2022-08-29 17:59:22.727 INFO: FAILED DEPLOYMENTS: 1
+2022-08-29 17:59:22.727 INFO: DEPLOYMENT "dek_test": FAILED
+2022-08-29 17:59:22.728 INFO: ====================
+2022-08-29 17:59:22.728 INFO: Deployment failed, pulling logs

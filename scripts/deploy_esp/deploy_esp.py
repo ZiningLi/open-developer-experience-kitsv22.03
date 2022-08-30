@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2021-2022 Intel Corporation
+# Copyright (c) 2021 Intel Corporation
 
 # pylint: disable=too-many-lines
 
@@ -34,6 +34,7 @@ start ESP services again:       <script> --config my_config.yaml --run-esp-for-u
 """
 
 import argparse
+import enum
 import glob
 import logging
 import os
@@ -43,31 +44,31 @@ import shutil
 import signal
 import subprocess # nosec - bandit: security considered
 import sys
-import secrets
-import tempfile
 import traceback
 import urllib.parse
 
-import seo.config
-import seo.error
-import seo.git
-import seo.stage
-import seo.shell
-import seo.yaml
+
+_GH_TOKEN_OPT = "--github-token" # nosec - B105 (Possible hardcoded password)
+_GH_USER_OPT = "--github-user"
+_TS_REF = "See the Troubleshooting section of the Intel® Smart Edge Open Provisioning Process document"
+
+class Codes(enum.Enum):
+    """ Script exit codes """
+    NO_ERROR = 0
+    GENERIC_ERROR = 1
+    MISSING_PREREQUISITE = 2
+    ARGUMENT_ERROR = 3
+    CONFIG_ERROR = 4
+    RUNTIME_ERROR = 5
 
 
-_GIT_PASSWORD_OPT = "--git-password" # nosec - B105 (Possible hardcoded password)
-_GIT_USER_OPT = "--git-user"
-
-
-_CONNECTIVITY_TEST_TIMEOUT = 60 # seconds
-_CONNECTIVITY_TEST_IMAGE = "alpine:3.13"
-
-
-_REQ_DOCK_VER = (20, 10, 11)
-_REQ_DOCK_COMP_VER = (1, 23, 2)
-
-_DEFAULT_BIOS =  { 'tpm': False, 'secure_boot': False}
+class AppException(Exception):
+    """Exception indicating application error which, if not handled, should result in the
+    application exit with the error message printed to the screen"""
+    def __init__(self, code, msg=None):
+        super().__init__()
+        self.code = code
+        self.msg = msg
 
 
 try:
@@ -77,7 +78,9 @@ except ModuleNotFoundError:
         "ERROR: Couldn't import yaml module.\n"
         "   It can be installed using following command:\n"
         "   $ pip3 install pyyaml\n")
-    sys.exit(seo.error.Codes.MISSING_PREREQUISITE)
+    sys.exit(Codes.MISSING_PREREQUISITE)
+
+# ---------- UTILS ----------
 
 # https://github.com/yaml/pyyaml/issues/234
 class Dumper(yaml.Dumper):  # pylint: disable=too-many-ancestors
@@ -85,35 +88,68 @@ class Dumper(yaml.Dumper):  # pylint: disable=too-many-ancestors
     def increase_indent(self, flow=False, indentless=False):
         return super().increase_indent(flow=flow, indentless=False)
 
-# https://stackoverflow.com/questions/37200150/can-i-dump-blank-instead-of-null-in-yaml-pyyaml
-# change a None object representer in custom Dumper class (empty string instead of default 'null')
-def represent_none(dumper, _):
-    """ Custom representer for None object """
-    return dumper.represent_scalar('tag:yaml.org,2002:null', '')
-yaml.add_representer(type(None), represent_none, Dumper=Dumper)
+def stage(stage_name):
+    """ Convenient decorator for main stage functions """
+    if stage_name not in STAGES.keys():
+        raise ValueError(f"Stage '{stage_name}' not defined.")
 
-# change an empty dict object representer in custom Dumper class (empty string instead of default '{}')
-def represent_dict(dumper, data):
-    """ Custom representer for empty dict object """
-    if not data:
-        return dumper.represent_data(None)
-    else:
-        return dumper.represent_dict(data.items())
-yaml.add_representer(dict, represent_dict, Dumper=Dumper)
+    def func_wrapper(func):
+        def wrapper(*args, **kwargs):
+            if pathlib.Path(STAGES[stage_name]['status_file']).exists():
+                logging.info("Skipping stage %s", STAGES[stage_name]['display'])
+                return None
+
+            logging.info("STAGE: %s", STAGES[stage_name]['display'])
+            res = func(*args, **kwargs)
+            # create timestamp file
+            pathlib.Path(STAGES[stage_name]['status_file']).touch()
+            return res
+        return wrapper
+    return func_wrapper
 
 
-def is_profile_bare_os(profile):
-    """ Check if profile is set up as bare os profile """
-    # bare_os field is optional
-    return 'bare_os' in profile and profile['bare_os'] is True
+def check_stages(start_from):
+    """ Trigger stages rerun """
+
+    # nothing to do if no stage passed on cmd line
+    if not start_from:
+        return
+
+    def tryint(i):
+        # we usually expect int, can be also single char like 'a' or 'b'
+        try:
+            return int(i)
+        except ValueError:
+            return i.strip()
+
+    def to_indices(order):
+        return [tryint(i)  for i in order.split('.')]
+
+    start_order = to_indices(STAGES[start_from]['order'])
+
+    # trigger stages rerun by removing status files
+    for other_stage_name, other_stage in STAGES.items():
+        other_order = to_indices(other_stage['order'])
+        status_file = pathlib.Path(other_stage['status_file'])
+        # remove status file for this stage and all beyond, including branches
+        if len(start_order) == 1 and start_order[0] <= other_order[0]:
+            if status_file.exists():
+                logging.info("Will rerun stage %s", other_stage_name)
+                status_file.unlink()
+        # if we have a split, don't interfere with other branch, but if those branches
+        # join back afterwards, remove resulting children and beyond.
+        elif len(start_order) == 2:
+            if len(other_order) == 1 and start_order[0] < other_order[0] or \
+               len(other_order) == 2 and start_order == other_order:
+                if status_file.exists():
+                    status_file.unlink()
+        # TODO: in case more nesting levels than 2 are required, support it here
 
 # ---------------------------------
 
-# path where Experience Kits will be cloned to
-EK_PATH = '/opt/seo'
-
+EXIT_ERROR_CODE = 1
+SCENARIOS = ["single-node", "multi-node"]
 DISTROS = ['centos', 'rhel', 'ubuntu']
-HOST_NAMES = ['controller', 'node01']
 
 # stages 'clone-esp', 'configure-esp', 'build-esp' are sequential, while later stages 'build-usb-images'
 # and 'configure-profiles' are optional (can be run independent of each other), as reflected by 'order' field.
@@ -156,7 +192,8 @@ def parse_args(default_config_path, experience_kit_name):
         description=f"""
             Start the Smart Edge Open {experience_kit_name}cluster provisioning process.
             The provisioning process consists of the provisioning server setup, the installation
-            media preparation, and the deployment of cluster nodes on selected machines.""")
+            media preparation, and the deployment of cluster nodes on selected machines.
+            For details see the scripts/deploy_esp/README.md document""")
     p.add_argument(
         "--init-config", action="store_true",
         help="generate default provisioning configuration and print it to the standard output")
@@ -165,11 +202,11 @@ def parse_args(default_config_path, experience_kit_name):
         default=default_config_path,
         help="provisioning configuration file PATH (default: %(default)s)")
     p.add_argument(
-        _GIT_USER_OPT, action="store", dest="git_user", metavar="NAME",
-        help="NAME of the git remote user to be used to clone required Smart Edge Open repositories")
+        _GH_USER_OPT, action="store", dest="github_user", metavar="NAME",
+        help="NAME of the GitHub user to be used to clone required Smart Edge Open repositories")
     p.add_argument(
-        _GIT_PASSWORD_OPT, action="store", dest="git_password", metavar="VALUE",
-        help="Git remote token to be used to clone required Smart Edge Open repositories")
+        _GH_TOKEN_OPT, action="store", dest="github_token", metavar="VALUE",
+        help="GitHub token to be used to clone required Smart Edge Open repositories")
     p.add_argument(
         "--dockerhub-user", action="store", dest="dockerhub_user", metavar="NAME",
         help="NAME of the user to authenticate with DockerHub during Live System stage")
@@ -179,21 +216,21 @@ def parse_args(default_config_path, experience_kit_name):
     p.add_argument(
         "--registry-mirror", action="store", dest="registry_mirror", metavar="URL",
         help="add the URL to the list of local Docker registry mirrors")
-
+    p.add_argument(
+        "--start-from", action="store", help="restart build process from selected phase",
+        choices=STAGES.keys())
     p.add_argument("--run-esp-for-usb-boot", action="store_true", default=False,
                    help="start ESP services for booting from USB image")
     p.add_argument("--run-esp-for-pxe-boot", action="store_true", default=False,
                    help="start ESP services for booting from PXE")
     p.add_argument("--stop-esp", action="store_true", default=False,
                    help="stop ESP services")
-    p.add_argument("--cleanup", action="store_true", dest="force",
-                   help="cleanup existing build artifacts before "
-                   "taking any other actions (stop the services if needed)")
-    dev_args = p.add_argument_group('Development options')
-    dev_args.add_argument("--debug", action="store_true", dest="debug",
-                          help="provide more verbose diagnostic information")
-    dev_args.add_argument("--start-from", action="store", help="restart build process from selected phase",
-                          choices=STAGES.keys())
+    p.add_argument(
+        "--debug", action="store_true", dest="debug",
+        help="provide more verbose diagnostic information")
+    p.add_argument(
+        "--cleanup", action="store_true", dest="force",
+        help="cleanup existing build artifacts before taking any other actions (stop the services if needed)")
     return p.parse_args()
 
 
@@ -207,14 +244,35 @@ def init_config(default_config_path):
     logging.info("Provisioning configuration generated")
 
 
+def get_config(config_file_path):
+    """ Read and parse given provisioning config file """
+
+    logging.debug("Trying to read and parse provisioning configuration file ('%s')", config_file_path)
+
+    try:
+        with open(config_file_path) as config_file:
+            raw_config = config_file.read()
+    except (FileNotFoundError, PermissionError) as e:
+        raise AppException(
+            Codes.ARGUMENT_ERROR,
+            f"Failed to load the config file: {e}") from e
+
+    try:
+        return yaml.safe_load(raw_config)
+    except yaml.YAMLError as e:
+        raise AppException(
+            Codes.CONFIG_ERROR,
+            f"Config file format error: {e}") from e
+
+
 def apply_args(cfg, args):
     """ Overwrite loaded configuration with applicable command line arguments (if specified) """
 
-    if args.git_user is not None:
-        cfg.setdefault("git", {})["user"] = args.git_user
+    if args.github_user is not None:
+        cfg.setdefault("github", {})["user"] = args.github_user
 
-    if args.git_password is not None:
-        cfg.setdefault("git", {})["password"] = args.git_password
+    if args.github_token is not None:
+        cfg.setdefault("github", {})["token"] = args.github_token
 
     if args.registry_mirror is not None:
         # Following condition is expected to be enforced earlier (validate_config function):
@@ -257,7 +315,7 @@ def is_repo_accessible(url, args=None):
 
 def verify_repo_status(desc, url, config, args):
     """ Verify if given repo is a public repo or a private repo but
-        the provided credentials allow to access it. In case of
+        the provided GitHub credentials allow to access it. In case of
         the access failure raise the application exception
     """
 
@@ -267,126 +325,186 @@ def verify_repo_status(desc, url, config, args):
 
     logging.debug("%s repository is not public: %s", desc, url)
 
+    if not config['github']['user']:
+        raise AppException(
+            Codes.CONFIG_ERROR,
+            f"Either, the {desc} repository is private and requires the github user to be specified using the"
+            f" {_GH_USER_OPT} option, or the repository url ('{url}') is incorrect")
+    if not config['github']['token']:
+        raise AppException(
+            Codes.CONFIG_ERROR,
+            f"Either the {desc} repository is private and requires the github token to be specified using the"
+            f" {_GH_TOKEN_OPT} option, or the repository url ('{url}') is incorrect")
 
-    if 'git' not in config:
-        raise seo.error.AppException(
-            seo.error.Codes.CONFIG_ERROR,
-            f"The {desc} repository is private and requires the git user and password to be specified using the"
-            f" {_GIT_USER_OPT} option or custom config file with git credentials,"
-            f" or the repository url ('{url}') is incorrect")
-
-    if not config['git']['user']:
-        raise seo.error.AppException(
-            seo.error.Codes.CONFIG_ERROR,
-            f"Either, the {desc} repository is private and requires the git remote user to be specified using the"
-            f" {_GIT_USER_OPT} option, or the repository url ('{url}') is incorrect")
-
-    if not config['git']['password']:
-        raise seo.error.AppException(
-            seo.error.Codes.CONFIG_ERROR,
-            f"Either the {desc} repository is private and requires the git remote token to be specified using the"
-            f" {_GIT_PASSWORD_OPT} option, or the repository url ('{url}') is incorrect")
-
-    auth_url = seo.git.apply_credentials(url, config['git']['user'], config['git']['password'])
+    auth_url = apply_token(url, "{0}:{1}".format(config['github']['user'], config['github']['token']))
 
     if not is_repo_accessible(auth_url, args):
-        raise seo.error.AppException(
-            seo.error.Codes.CONFIG_ERROR,
-            f"Either the {desc} repository url ('{url}') or the provided git remote credentials are incorrect")
+        raise AppException(
+            Codes.CONFIG_ERROR,
+            f"Either the {desc} repository url ('{url}') or the provided github credentials are incorrect")
 
     logging.info(
         "%s repository is private and the %s's credentials are working: %s",
-        desc, config['git']['user'], url)
+        desc, config['github']['user'], url)
 
 
-def remove_files_recurse_by_pattern(path, pattern):
-    """Iterates recursively over files in given path and removes which match pattern"""
-    for root, _, files in os.walk(path):
-        for filename in files:
-            if re.match(pattern, filename):
-                os.remove(os.path.join(root, filename))
-                logging.debug("File %s/%s cleaned.", path, filename)
+def verify_esp_path_length(dest_path):
+    """
+    The ESP repository destination directory path mustn't be too long to not hit the unix socket path limit within the
+    ESP code.
+
+    See ESS-3861 and https://man7.org/linux/man-pages/man7/unix.7.html
+    """
+
+    expected_socket_path = os.path.join(
+        os.path.realpath(os.path.abspath(dest_path)),
+        "data/tmp/build/docker.sock")
+
+    diff = len(expected_socket_path) - 107
+
+    if diff > 0:
+        diff_str = "1 character" if diff == 1 else f"{diff} characters"
+
+        raise AppException(
+            Codes.CONFIG_ERROR,
+            "The current working directory path combined with the ESP destination directory path"
+            " will result in the Unix socket path length limit being exceeded. Please make following path"
+            f" shorter by at least {diff_str} to be able to proceed\n"
+            f"    {expected_socket_path}\n"
+            f"    {_TS_REF}")
+
+
+def validate_config(config):
+    """ Perform some basic sanity check of provided user config """
+
+    logging.debug("Validating the provisioning configuration")
+
+    # Check correctness of first 2 levels of config nesting (missing sections, missing fields,
+    #  incorrect types):
+
+    assert isinstance(config, dict) # nosec B101 - used just for development
+
+    # NOTE: We should use some YAML schema validation library for most of these checks
+
+    for main_section in ('github', 'esp', 'profiles', 'dnsmasq', 'usb_images', 'ntp_server', 'docker'):
+        if main_section not in config:
+            raise AppException(
+                Codes.CONFIG_ERROR,
+                f"The provisioning configuration file is missing the '{main_section}' section")
+
+    for main_section in ('github', 'esp', 'dnsmasq', 'usb_images', 'docker'):
+        if not isinstance(config[main_section], dict):
+            raise ValueError(f"Config: section '{main_section}' must be a dictionary")
+
+    if not isinstance(config['ntp_server'], str):
+        raise ValueError("Config: section 'ntp_server' must be a string")
+
+    if not isinstance(config['docker']['registry_mirrors'], list):
+        raise ValueError("Config: section 'docker.registry_mirrors' must be a list of strings")
+
+    if not isinstance(config['docker']['dockerhub'], dict):
+        raise ValueError("Config: section 'docker.dockerhub' must be a dictionary")
+
+    if not isinstance(config['docker']['dockerhub']['username'], str):
+        raise ValueError("Config: section 'docker.dockerhub.username' must be a string")
+
+    if not isinstance(config['docker']['dockerhub']['password'], str):
+        raise ValueError("Config: section 'docker.dockerhub.password' must be a string")
+
+    if not isinstance(config['profiles'], list):
+        raise ValueError("Config: section 'profiles' must be a list")
+
+    for field in ('token', 'user'):
+        if field not in config['github']:
+            raise AppException(
+                Codes.CONFIG_ERROR,
+                "The 'githhub' section of the provisioning configuration file is missing the"
+                f"'{field}' field")
+
+    for field in ('url', 'branch', 'dest_dir'):
+        if field not in config['esp']:
+            raise ValueError(f"Config: section 'esp' is missing field '{field}'")
+
+    verify_esp_path_length(config["esp"]["dest_dir"])
+
+    for field in ('build', 'bios', 'efi', 'all_in_one', 'output_path'):
+        if field not in config['usb_images']:
+            raise ValueError(f"Config: section 'usb_images' is missing field '{field}'")
+
+    if 'enabled' not in config['dnsmasq']:
+        raise ValueError("Config: section 'dnsmasq' is missing field 'enabled'")
+
+    # ---- do a couple of more checks (common mistakes)
+
+    if not config['profiles']:
+        raise ValueError("Config: You must define at least a single profile")
+
+    # some fields in profiles are mandatory, while others are optional
+    for idx, profile in enumerate(config['profiles']):
+        for field in ('name', 'url', 'branch', 'scenario', 'experience_kit'):
+            if field not in profile:
+                raise ValueError(f"Config: profile no.{idx} is missing field '{field}'")
+
+        if profile['scenario'] not in SCENARIOS:
+            raise ValueError(
+                f"Config: Invalid scenario: {profile['scenario']}. Possible options: {SCENARIOS}")
+
+        if not isinstance(profile['experience_kit'], dict):
+            raise ValueError(f"Config: profile no.{idx} section 'experience_kit' must be a dictionary")
+
+        for field in ('url', 'branch', 'deployment'):
+            if field not in profile['experience_kit']:
+                raise ValueError(f"Config: profile no.{idx} is missing field 'experience_kit.{field}'")
 
 
 def check_repositories(config, args):
     """Check if all the repositories occurring in the configuration file are accessible using given configuration"""
 
     verify_repo_status("ESP", config["esp"]["url"], config, args)
-
-    verified_repos = []
-
     for profile in config['profiles']:
-        if profile['url'] not in verified_repos:
-            verify_repo_status("ESP Profile", profile["url"], config, args)
-            verified_repos.append(profile['url'])
-
-        if not is_profile_bare_os(profile):
-            if profile['experience_kit']['url'] not in verified_repos:
-                verify_repo_status("Experience Kit", profile["experience_kit"]["url"], config, args)
-                verified_repos.append(profile['experience_kit']['url'])
+        verify_repo_status("ESP Profile", profile["url"], config, args)
+        verify_repo_status("Experience Kit", profile["experience_kit"]["url"], config, args)
 
 
-def get_version(command: str) -> tuple:
-    """executes command which is supposed to output a version like 1.2.3"""
+def check_rpm_package(pkgname, friendly_name):
+    """ Check if RPM package is installed """
 
-    try:
-        logging.debug("Executing command `%s` to get program version", command)
-
-        out = subprocess.check_output(command.split(" ")).decode("utf-8")  # nosec - B603 (subprocess call)
-    except (FileNotFoundError, PermissionError) as ex:
-        raise seo.error.AppException(
-            seo.error.Codes.MISSING_PREREQUISITE,
-            f"command: '{command}' cannot be executed\n"
-            f"    {seo.error.TS_REF}")
-    except subprocess.CalledProcessError as ex:
-        raise seo.error.AppException(
-            seo.error.Codes.MISSING_PREREQUISITE,
-            f"{command} returned an error {ex.returncode}.\n"
-            f"    {seo.error.TS_REF}")
-
-    match = re.search(r'\d+(\.\d+)+', out)
-
-    if match is None:
-        raise seo.error.AppException(
-            seo.error.Codes.MISSING_PREREQUISITE,
-            f"cannot parse version string from `{command}` output\n"
-            f"    {seo.error.TS_REF}")
-
-    version = match.group(0)
-    version = tuple(map(int, version.split(".")))
-
-    logging.debug("Version parsed is %s", ".".join(map(str, version)))
-
-    return version
+    cmd = ["rpm", "--quiet", "-q", pkgname]
+    proc = subprocess.run( # nosec - B603 (subprocess call)
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False)
+    if proc.returncode == 0:
+        return True
+    else:
+        raise AppException(
+            Codes.MISSING_PREREQUISITE,
+            f"{friendly_name} has to be installed on this machine for the provisioning process to succeed.\n"
+            f"    {_TS_REF}")
 
 
-def check_version(command: str, required: tuple):
-    """ Check if tool is installed and is at least the minimum required version
-        Throws an exception if version requirements are not satisfied to stop program execution"""
+def check_apt_package(pkgname, friendly_name):
+    """ Check if APT-GET package is installed """
 
-    current = get_version(command)
-
-    cur_str = '.'.join(map(str, current))
-    req_str = '.'.join(map(str, required))
-
-    if current < required:
-        raise seo.error.AppException(
-            seo.error.Codes.MISSING_PREREQUISITE,
-            f"{command} doesn't meet minimum version requirement. Current version: {cur_str} is less than {req_str}.\n"
-            f"    {seo.error.TS_REF}")
-
-    logging.debug("Version check %s required: %s current: %s passed", command, req_str, cur_str)
+    cmd = ["apt", "-qq", "list", pkgname]
+    proc = subprocess.run( # nosec - B603 (subprocess call)
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False)
+    if proc.returncode == 0 and '[installed]' in proc.stdout:
+        return True
+    else:
+        raise AppException(
+            Codes.MISSING_PREREQUISITE,
+            f"{friendly_name} has to be installed on this machine for the provisioning process to succeed.\n"
+            f"    {_TS_REF}")
 
 
-def check_preconditions(args):
+def check_preconditions():
     """ Check script's preconditions """
 
     logging.debug("Check preconditions")
 
     # check current user permissions
     if os.getuid() != 0:
-        raise seo.error.AppException(
-            seo.error.Codes.MISSING_PREREQUISITE,
+        raise AppException(
+            Codes.MISSING_PREREQUISITE,
             "This script must be run as the root user; Use the 'sudo su -' command to change it")
 
     # detect OS (works at least for CentOS, RHEL and Ubuntu)
@@ -401,11 +519,15 @@ def check_preconditions(args):
     else:
         logging.warning("No detected host Linux distribution!")
 
-    if distro not in ("rhel", "centos", "ubuntu"):
-        logging.warning("Unsupported linux distribution. There might be some issues.")
-
-    # check if Docker is installed and is at least the minimum required version
-    check_version("docker --version", _REQ_DOCK_VER)
+    # check if docker is installed
+    if distro in ("rhel", "centos"):
+        check_rpm_package("docker-ce", "Docker")
+        check_rpm_package("docker-ce-cli", "Docker CLI")
+        check_rpm_package("containerd.io", "The containerd.io runtime")
+    elif distro == "ubuntu":
+        check_apt_package("docker-ce", "Docker")
+        check_apt_package("docker-ce-cli", "Docker CLI")
+        check_apt_package("containerd.io", "The containerd.io runtime")
 
     # hint about docker autostart
     cmd = "systemctl list-unit-files | grep docker.service | awk '{print $2}'"
@@ -415,51 +537,34 @@ def check_preconditions(args):
         logging.warning("Docker package is not configured to run at system boot. "
                         "Enable it with 'systemctl enable docker --now'")
 
-    # check if Docker-Compose is installed and is at least the minimum required version
-    check_version("docker-compose --version", _REQ_DOCK_COMP_VER)
+    # check if docker-compose is installed (local, not rpm, as we need newer version than available in repo)
+    pkgname = 'docker-compose'
+    if shutil.which(pkgname) is None:
+        raise AppException(
+            Codes.MISSING_PREREQUISITE,
+            "The docker-compose tool has to be installed on this machine for the provisioning process to succeed.\n"
+            f"    {_TS_REF}")
 
-    # sanity checks for docker
-    tmpdir = tempfile.mkdtemp()
-    with open(f"{tmpdir}/Dockerfile", "w") as f:
-        f.write(f"FROM {_CONNECTIVITY_TEST_IMAGE}\nRUN apk update && apk add --no-cache wget")
+    # sanity check for docker
+    cmd = ['docker', 'run', 'busybox']
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, # nosec - B603
+                          universal_newlines=True, check=False)
+    if proc.returncode != 0:
+        print(proc.stderr)
+        raise RuntimeError(
+            "Command '%s' failed - is docker configured properly?" % ' '.join(cmd))
 
-    cmds = [
-        ["docker", "pull", _CONNECTIVITY_TEST_IMAGE],
-        ["docker", "run", "--rm", "--init", _CONNECTIVITY_TEST_IMAGE, "sh", "-c",
-         f"timeout {_CONNECTIVITY_TEST_TIMEOUT} apk update"],
-        # timeout does not work inside docker build, so it'll be used to wrap whole `docker build` command
-        ["timeout", f"{_CONNECTIVITY_TEST_TIMEOUT}",
-         "docker", "build", "--no-cache", "-t", "provision-docker-test", tmpdir],
-        ['docker', 'image', 'rm', 'provision-docker-test']
-    ]
-
-    for cmd in cmds:
-        logging.info("Testing Docker configuration: %s", subprocess.list2cmdline(cmd))
-        try:
-            if not args.debug:
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True) # nosec - B602
-            else:
-                subprocess.run(cmd, check=True) # nosec - B602
-        except subprocess.CalledProcessError as e:
-            shutil.rmtree(tmpdir)
-            raise seo.error.AppException(
-                seo.error.Codes.MISSING_PREREQUISITE,
-                f"Failed to confirm that Docker is configured correctly\n"
-                f"    Following command failed:\n"
-                f"    {subprocess.list2cmdline(cmd)}") from e
-
-    shutil.rmtree(tmpdir)
 
 def run_esp_script(cmd, workdir):
     """ Helper to run ESP scripts: build.sh, makeusb.sh and run.sh """
-    script_name = os.path.basename(cmd[0])
-    cmd = " ".join(cmd)
+    if isinstance(cmd, list):
+        cmd = " ".join(cmd)
 
     # convert to Path if string was passed
     workdir = pathlib.Path(workdir)
     if not workdir.exists():
-        raise seo.error.AppException(
-            seo.error.Codes.CONFIG_ERROR,
+        raise AppException(
+            Codes.CONFIG_ERROR,
             f"Workdir does not exist in expected location '{workdir}', required by '{cmd}'")
 
     logging.debug("Running command: %s", cmd)
@@ -473,10 +578,8 @@ def run_esp_script(cmd, workdir):
                     print(line, end='')
 
             if proc.poll() != 0:
-                raise seo.error.AppException(
-                    seo.error.Codes.RUNTIME_ERROR,
-                    f"ESP script failed: {script_name}\n"
-                    f"    {seo.error.TS_REF}")
+                raise RuntimeError(
+                    f"Running ESP script failed. Inspect output and logs in {workdir}/builder.log")
         except KeyboardInterrupt as e:
             # gracefully handle SIGINT, kill script that may be stuck in background.
             # note: since script can start bunch of other scripts, it sometimes is not killed with simple
@@ -485,28 +588,29 @@ def run_esp_script(cmd, workdir):
             raise RuntimeError("Interrupted by user") from e
 
 
-def is_esp_running(workdir, service='web'):
+def is_esp_running(workdir):
     """ Helper to get info if ESP server is currently running """
 
-    # this will print just id/hex of a given ESP service if it's up, and nothing if it's down.
-    # we check web service to determine if script was already ran by user with --run-esp-for-xxx option,
-    # (note: some base services like core or mirror are up right after build.sh, before run.sh was even started)
-    cmd_tmpl = ['docker-compose', 'ps', '-q']
+    # this will print just id/hex of a given service if it's up, and nothing if it's down.
+    # we chose web, as some services like core or mirror are up right after build.sh, before
+    # run.sh was started (and web is not one of those services)
+    cmd = ['docker-compose', 'ps', '-q', 'web']
 
     # convert to Path if string was passed
     workdir = pathlib.Path(workdir)
     if not workdir.exists():
-
-        cmd = " ".join(cmd_tmpl)
-        raise seo.error.AppException(
-            seo.error.Codes.CONFIG_ERROR,
+        cmd = " ".join(cmd)
+        raise AppException(
+            Codes.CONFIG_ERROR,
             f"Workdir does not exist in expected location '{workdir}', required by '{cmd}'")
 
-    cmd = cmd_tmpl.copy() + [service]
     proc = subprocess.run(cmd, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, # nosec - B603
                           universal_newlines=True, check=False)
-
-    return proc.returncode == 0 and proc.stdout.strip() != ''
+    # pylint: disable=simplifiable-if-statement
+    if proc.returncode == 0 and proc.stdout.strip() != '':
+        return True
+    else:
+        return False
 
 
 def stop_esp(workdir):
@@ -519,8 +623,8 @@ def stop_esp(workdir):
 
 def run_esp(config, args):
     """ Executes ESP's run.sh script """
-    usb_boot_cmd = ['./run.sh', '--no-tail-logs', '--no-dnsmasq']
-    pxe_boot_cmd = ['./run.sh', '--no-tail-logs']
+    usb_boot_cmd = ['./run.sh', '--no-dnsmasq']
+    pxe_boot_cmd = ['./run.sh']
 
     workdir = pathlib.Path(config['esp']['dest_dir'])
 
@@ -551,24 +655,11 @@ def run_esp(config, args):
             stop_esp(workdir)
 
 
-def print_profile_credentials(config):
-    """ Display profile credentials if available """
-
-    for profile in config['profiles']:
-        try:
-            username = profile['account']['username']
-            password = profile['account']['password']
-        except (TypeError, KeyError):
-            pass
-        else:
-            print(f"Credentials for profile {profile['name']}:\n\tUsername: {username}\n\tPassword: {password}")
-
-
 def configure_se_profile_group_vars_all(cfg, profile_path):
     """ Configure profile's group_vars/all.yml file based on config variables and env vars """
 
     all_vars = {}
-    all_vars['git_repo_token'] = cfg['git']['password']
+    all_vars['git_repo_token'] = cfg['github']['token']
 
     proxy = {}
     for p in ['http_proxy', 'https_proxy', 'no_proxy', 'ftp_proxy']:
@@ -604,22 +695,13 @@ def configure_se_profile_customize_vars(profile, profile_path):
 
     # serialize vars
     for name, body, seo_path in items:
-        # since we already dumped some vars to all.yml, append or overwrite in that case
-        seo_full_path = profile_path / "files/seo" / seo_path
+        output = yaml.dump(body, Dumper=Dumper, default_flow_style=False)
+        # since we already dumped some vars to all.yml, append in that case
         if name == 'all':
-            all_vars = seo.yaml.load(seo_full_path) # nosec - B506 (False positive: It is not a yaml.load call)
-            for key, value in body.items():
-                if key in all_vars and isinstance(value, dict):
-                    all_vars[key].update(value)
-                else:
-                    all_vars[key] = value
-            content = all_vars
+            mode = 'a'
         else:
-            content = body
-
-        output = yaml.dump(content, Dumper=Dumper, default_flow_style=False)
-        with open(seo_full_path, "w") as f:
-            f.write(output)
+            mode = 'w'
+        open(profile_path / "files/seo" / seo_path, mode).write(output)
 
 
 def configure_se_profile_config_yaml(config, profile, profile_path):
@@ -628,30 +710,13 @@ def configure_se_profile_config_yaml(config, profile, profile_path):
     with open(profile_path / "conf/config.yml", "r+") as f:
         content = f.read()
 
-        # first clean any leftovers
-        for param in ('username', 'password', 'ntp_server', 'docker_login_user', 'docker_login_pass', 'bare_os'):
-            regexp = fr'( {param}=\S*)'
-            content = re.sub(regexp, '', content)
-
-        try:
-            username = profile['account']['username']
-        except (TypeError, KeyError):
-            username = "smartedge-open"
-            print(f"Setting default username '{username}' for profile {profile['name']}")
-
-        try:
-            password = profile['account']['password']
-        except (TypeError, KeyError):
-            password = secrets.token_urlsafe(32)
-            print(f"Setting default password '{password}' for profile {profile['name']}")
-
-        content = re.sub(
-            r'(kernel_arguments:.*)$',
-            f"\\1 username={username} "
-            f"password={password}",
-            content)
-
-        profile['account'] = dict(username=username, password=password)
+        if 'account' in profile and \
+            'username' in profile['account'] and \
+            'password' in profile['account']:
+            content = re.sub(
+                r'username=([^\s]+)', f"username={profile['account']['username']}", content)
+            content = re.sub(
+                r'password=([^\s]+)', f"password={profile['account']['password']}", content)
 
         if config['docker']['dockerhub']['username'] and config['docker']['dockerhub']['password']:
             content = re.sub(
@@ -666,208 +731,59 @@ def configure_se_profile_config_yaml(config, profile, profile_path):
                 f"\\1 ntp_server={config['ntp_server']}",
                 content)
 
-        if is_profile_bare_os(profile):
+        f.seek(0)
+        f.write(content)
+        f.truncate()
+
+
+def configure_se_profile_provision_settings(config, profile, profile_path):
+    """ Configure profile's provision_settings file """
+
+    with open(profile_path / "files/seo/provision_settings", "r+") as f:
+        content = f.read()
+
+        ek_url = profile['experience_kit']['url'].replace('https://', '').replace('http://', '')
+        content = re.sub(
+            r'url=(.*)', f"url={ek_url}", content)
+        content = re.sub(
+            r'flavor=(.*)', f"flavor={profile['experience_kit']['deployment']}", content)
+        content = re.sub(
+            r'branch=(.*)', f"branch={profile['experience_kit']['branch']}", content)
+        content = re.sub(
+            r'scenario=(.*)', f"scenario={profile['scenario']}", content)
+        content = re.sub(
+            r'gh_token=(.*)', f"gh_token={config['github']['token']}", content)
+        if 'controlplane_mac' in profile and profile['controlplane_mac']:
             content = re.sub(
-                r'(kernel_arguments:.*)$',
-                "\\1 bare_os=true",
-                content)
+                r'controller_mac=(.*)', f"controller_mac={profile['controlplane_mac']}", content)
+
+        # first remove all previous sideload definitions
+        content = re.sub(
+            r'^files\[(.*)\]=(.*)[\r\n]', '', content, flags=re.MULTILINE)
+        if 'sideload' in profile and profile['sideload'] is not None:
+            for item in profile['sideload']:
+                filename = os.path.basename(item['file_path'])
+                sideload_filepath = profile_path / "files/seo/sideload" / filename
+                # copy file to sideload dir, replacing a previous one if existing
+                shutil.copyfile(item['file_path'], sideload_filepath)
+                # append sideload definition
+                content += 'files["{0}"]="{1}"\n'.format(filename, item['dest_path'])
 
         f.seek(0)
         f.write(content)
         f.truncate()
 
 
-def configure_se_profile_customize_inventory(profile, profile_path):
-    """ Configure profile's inventory files, with additional hosts groups """
-
-    if profile['scenario'] == 'single-node':
-        items = [('all', 'single_node.yml'), (None, 'controller.yml'), (None, 'node.yml')]
-    elif profile['scenario'] == 'multi-node':
-        items = [(None, 'single_node.yml'), ('only_controller', 'controller.yml'), ('all', 'node.yml')]
-
-    for mode, inventory_filename in items:
-        inventory_groups = {}
-        inventory_output = ''
-        # no need to fill inventory groups if mode is None, this will effectively
-        # remove leftovers from unused files, in case of switching single-node <-> multi-node
-        if 'extra_inventory_groups' in profile and \
-           profile['extra_inventory_groups'] is not None \
-           and mode is not None:
-            for group_name, hosts in profile['extra_inventory_groups'].items():
-                # insert new items if not existing yet
-                inventory_groups.setdefault(group_name, {})
-                inventory_groups[group_name].setdefault('hosts', {})
-                if hosts:
-                    for host_name in hosts.keys():
-                        if host_name not in HOST_NAMES:
-                            logging.warning("Inventory group contains unsupported host name: %s", host_name)
-                        else:
-                            # when dumping for controller's multi-node, skip over node group hosts
-                            if mode == 'only_controller' and host_name != 'controller':
-                                continue
-                            # insert new items if not existing yet
-                            inventory_groups[group_name]['hosts'].setdefault(host_name)
-            if inventory_groups:
-                inventory_output = yaml.dump(inventory_groups, Dumper=Dumper, default_flow_style=False)
-
-        # replace inventory groups
-        with open(profile_path / f"files/seo/inventories/{inventory_filename}", "r+") as f:
-            content = f.read()
-
-            marker_beg = '##extra_inventory_groups_begin##'
-            marker_end = '##extra_inventory_groups_end##'
-            content = re.sub(
-                fr'^({marker_beg}[\r\n])(.*[\r\n])*({marker_end})[\r\n]*', fr"\1{inventory_output}\3\n",
-                content, flags=re.MULTILINE)
-
-            f.seek(0)
-            f.write(content)
-            f.truncate()
-
-def adapt_to_profile(variables):
-    '''Adapts variable names to profile variable names according to mapping, temporary'''
-
-    mapping = {'address': 'redfish_ip',
-                'user': 'redfish_user',
-                'password': 'redfish_password',
-                'name': 'node_hostname',
-                'secure_boot': 'enable_secure_boot',
-                'tpm': 'enable_tpm'
-        }
-
-    return {mapping.get(name, name): value for name, value in variables.items()}
-
-
-def global_bmc_and_bios_configuration(config):
-    '''Returns global bios and bmc configuration in a single dictionary'''
-    variables = dict(_DEFAULT_BIOS)
-
-    if 'bmc' in config:
-        variables.update(config['bmc'])
-
-    if 'bios' in config:
-        variables.update(config['bios'])
-
-    return variables
-
-def configure_profile_settings(config, profile, profile_path):
-    """ Configure profile's provision_settings file """
-
-    variables = {
-        'ek_path': EK_PATH,
-        'scenario': profile['scenario'],
-        'git_user': config['git']['user'],
-        'git_password': config['git']['password']
-    }
-
-    if 'controlplane_mac' in profile and profile['controlplane_mac']:
-        variables['controller_mac'] = profile['controlplane_mac']
-
-    variables.update(global_bmc_and_bios_configuration(config))
-
-    if 'bios' in profile:
-        variables.update(profile['bios'])
-
-
-    if not is_profile_bare_os(profile):
-        variables.update({
-            'url':  profile['experience_kit']['url'],
-            'deployment': profile['experience_kit']['deployment'],
-            'branch': profile['experience_kit']['branch']
-        })
-
-    variables = adapt_to_profile(variables)
-
-    seo.shell.create_variables_file(profile_path / "files/seo/provision_settings", variables)
-
-
-def configure_se_profile_sideload_files(profile, profile_path):
-    """ Prepare files for sideloading onto provisioned system """
-
-    gen_script = profile_path / "files/seo/download_sideload_files.sh"
-    # remove leftover file
-    if gen_script.exists():
-        gen_script.unlink()
-
-    sideload_dir = profile_path / "files/seo/sideload"
-
-    # purge all previous sideload dir content, aside of .keep file
-    for p in sideload_dir.glob('*'):
-        if p.name != '.keep':
-            logging.debug("Purging file in sideload dir: %s", p.name)
-            shutil.rmtree(sideload_dir / p.name)
-
-    cmd_tmpl = 'mkdir -p %(parent_dir)s\n' \
-    'wget --header "Authorization: token ${param_token}" -O "%(dest_path)s" ' \
-    '"${param_bootstrapurl}/files/seo/sideload/%(sideload_path)s"\n'
-
-    output = ''
-    if 'sideload' in profile and profile['sideload'] is not None:
-        for idx, item in enumerate(profile['sideload']):
-            file_path = pathlib.Path(item['file_path'])
-            dest_path = pathlib.Path(item['dest_path'])
-            # dest_path can be absolute or relative (to the EK_PATH dir)
-            if not dest_path.is_absolute():
-                dest_path = pathlib.Path(EK_PATH, item['dest_path'])
-
-            if not file_path.exists():
-                logging.warning("File path for sideload '%s' does not exist! "
-                                "Make sure you passed absolute path", file_path)
-                continue
-
-            # create intermediate folders, to prevent name collisions
-            idx_dir = sideload_dir / f"item_{idx:0>3}"
-            idx_dir.mkdir()
-
-            if file_path.is_file():
-                # copy file to sideload dir
-                sideload_target = idx_dir / os.path.basename(file_path)
-                shutil.copyfile(file_path, sideload_target)
-
-                # if dest_path looks like dir path, we assume that filename should be appended to that dir path
-                if item['dest_path'].endswith('/'):
-                    dest_path = dest_path / os.path.basename(file_path)
-
-                # generate command to download it on the target machine
-                output += cmd_tmpl % {'parent_dir': str(dest_path.parent),
-                                      'dest_path': str(dest_path),
-                                      'sideload_path': sideload_target.relative_to(sideload_dir)}
-
-            elif file_path.is_dir():
-                # copy content of a folder to sideload dir
-                for p in file_path.glob('*'):
-                    sideload_target = idx_dir / p.name
-                    if p.is_dir():
-                        shutil.copytree(p, sideload_target)
-                    else:
-                        shutil.copyfile(p, sideload_target)
-
-                # for each file inside folder, generate command to download it on the target machine
-                for p in sorted(idx_dir.glob('**/*')):
-                    if p.is_file():
-                        new_dst_path = dest_path / p.relative_to(idx_dir)
-                        output += cmd_tmpl % {'parent_dir': str(new_dst_path.parent),
-                                              'dest_path': str(new_dst_path),
-                                              'sideload_path': p.relative_to(sideload_dir)}
-
-    # generate even empty file (file is always downloaded to target machine)
-    open(gen_script, "w").write(output)
-
-
-@seo.stage.stage('configure-profiles', STAGES)
+@stage('configure-profiles')
 def configure_se_profiles(config):
     """ Configure Smart Edge profiles """
 
     esp_path = pathlib.Path(config['esp']['dest_dir'])
     for profile in config['profiles']:
         profile_path = esp_path / f"data/usr/share/nginx/html/profile/{profile['name']}"
-        configure_profile_settings(config, profile, profile_path)
-        configure_profile_hosts_specific_settings(config, profile, profile_path)
-        if not is_profile_bare_os(profile):
-            configure_se_profile_group_vars_all(config, profile_path)
-            configure_se_profile_customize_vars(profile, profile_path)
-            configure_se_profile_customize_inventory(profile, profile_path)
-            configure_se_profile_sideload_files(profile, profile_path)
+        configure_se_profile_provision_settings(config, profile, profile_path)
+        configure_se_profile_group_vars_all(config, profile_path)
+        configure_se_profile_customize_vars(profile, profile_path)
 
 
 def copy_usb_image(config, bios, profile="all"):
@@ -880,8 +796,8 @@ def copy_usb_image(config, bios, profile="all"):
 
     image_path = workdir / f"data/usr/share/nginx/html/usb/{profile}/uos-{bios}.img"
     if not image_path.exists():
-        raise seo.error.AppException(
-            seo.error.Codes.RUNTIME_ERROR,
+        raise AppException(
+            Codes.RUNTIME_ERROR,
             "Installation image couldn't be found in the expected location:\n"
             f"    {image_path}")
 
@@ -915,7 +831,7 @@ def make_usb(workdir, bios, profile="all"):
     run_esp_script(cmd, workdir)
 
 
-@seo.stage.stage('build-usb-images', STAGES)
+@stage('build-usb-images')
 def build_usb_images(config):
     """ Executes make_usb() function and copies images to user's location """
 
@@ -947,43 +863,70 @@ def build_usb_images(config):
                 copy_usb_image(config, bios, profile)
 
 
-@seo.stage.stage('clone-esp', STAGES)
+def apply_token(url, token):
+    """Return the provided url with the user:password part replaced with the given token string"""
+
+    parsed = urllib.parse.urlparse(url)
+
+    if parsed.hostname is None:
+        logging.debug(
+            "The url ('%s') doesn't contain recognizable host name part (maybe it is missing the schema part?)."
+            " The token won't be applied", url)
+
+        return url
+
+    try:
+        port = parsed.port
+    except ValueError as e:
+        raise AppException(
+            Codes.CONFIG_ERROR,
+            f"The url ('{url}') contains invalid port number") from e
+
+    if not token and port is None:
+        netloc = parsed.hostname
+    elif not token:
+        netloc = f"{parsed.hostname}:{port}"
+    elif port is None:
+        netloc = f"{token}@{parsed.hostname}"
+    else:
+        netloc = f"{token}@{parsed.hostname}:{port}"
+
+    return parsed._replace(netloc=netloc).geturl()
+
+
+@stage('clone-esp')
 def clone_esp(config):
     """ Download ESP """
 
+    token = config['github']['token']
     esp_config = config['esp']
     dest = esp_config['dest_dir']
 
     with pathlib.Path(dest) as path:
         if path.exists():
             if not path.is_dir():
-                raise seo.error.AppException(
-                    seo.error.Codes.CONFIG_ERROR,
+                raise AppException(
+                    Codes.CONFIG_ERROR,
                     f"The ESP destination directory ('{dest}') already exists and is not a directory")
 
             logging.info("Removing already existing %s directory (stalled)", dest)
             shutil.rmtree(dest, ignore_errors=True)
 
-    def __make_cmd(user, password):
-        return ["git", "clone", seo.git.apply_credentials(esp_config['url'], user, password),
-        "--branch", esp_config['branch'], dest]
+    def __make_cmd(token):
+        return ["git", "clone", apply_token(esp_config['url'], token), "--branch", esp_config['branch'], dest]
 
-    if 'git' in config:
-        cmd_actual = __make_cmd(config['git']['user'], config['git']['password'])
-        cmd_anonym = __make_cmd("<user>", "<password>")
-    else:
-        cmd_actual = __make_cmd(None, None)
-        cmd_anonym = cmd_actual
+    cmd_actual = __make_cmd(token)
+    cmd_anonym = __make_cmd("<github-token>") if token else cmd_actual
 
     logging.debug("Executing command: %s", " ".join(cmd_anonym))
 
     try:
         subprocess.run(cmd_actual, check=True) # nosec - B603
     except subprocess.CalledProcessError as e:
-        raise seo.error.AppException(seo.error.Codes.RUNTIME_ERROR, "Failed to clone the ESP repository") from e
+        raise AppException(Codes.RUNTIME_ERROR, "Failed to clone the ESP repository") from e
 
 
-@seo.stage.stage('configure-esp', STAGES)
+@stage('configure-esp')
 def configure_esp(config):
     """ Populate ESP's conf/config.yml file.
         The file contains list of profiles and optional options for dnsmasq. """
@@ -1015,8 +958,8 @@ def configure_esp(config):
             'git_remote_url': p['url'],
             'profile_branch': p['branch'],
             'profile_base_branch': '',  # empty - SEO profiles do not split code into branches
-            'git_username': config['git']['user'],
-            'git_token': config['git']['password'],
+            'git_username': config['github']['user'],
+            'git_token': config['github']['token'],
             'name': p['name'],
             'custom_git_arguments': '--depth=1',
         }
@@ -1042,7 +985,7 @@ def configure_esp(config):
             f.truncate()
 
 
-@seo.stage.stage('build-esp', STAGES)
+@stage('build-esp')
 def build_esp(config):
     """ Runs ESP's build.sh script and prints the output. """
 
@@ -1080,11 +1023,14 @@ def cleanup(config):
 
     esp_path = pathlib.Path(config['esp']['dest_dir'])
 
-    if esp_path.exists():
-        if is_esp_running(esp_path, service='core'):
-            # in the end, this runs docker-compose down, which stops and removes containers
-            stop_esp(esp_path)
+    if esp_path.exists() and is_esp_running(esp_path):
+        # in the end, this runs docker-compose down, which stops and removes containers
+        stop_esp(esp_path)
+
+    try:
         shutil.rmtree(esp_path)
+    except FileNotFoundError as e:
+        logging.debug("Path '%s' doesn't exist", e.filename)
 
     for _, v in STAGES.items():
         status_file = pathlib.Path(v['status_file'])
@@ -1098,81 +1044,27 @@ def cleanup(config):
     except FileNotFoundError as e:
         logging.debug("Path '%s' doesn't exist", e.filename)
 
-
-def credentials_check_needed():
-    ''' Check stages that can be impacted by credentials change. '''
-
-    status_files = [
-        v['status_file'] for k, v in STAGES.items()
-        if k in ['clone-esp', 'configure-esp', 'configure-profiles']]
-    for status_file in status_files:
-        if not pathlib.Path(status_file).exists():
-            return True
-    return False
-
-
-def preconditions_check_needed():
-    ''' Check stages that can be impacted by environment preconditions change. '''
-    return not pathlib.Path(STAGES['build-esp']['status_file']).exists()
-
-
-def configure_profile_hosts_specific_settings(config, profile, profile_path):
-    '''
-    The function parse 'hosts' node in config file into separate
-    files for each host, files are named provision_settings_{mac}.
-    '''
-    # clean any old configuration
-    remove_files_recurse_by_pattern(path=profile_path, pattern=r'^(.*[0-9A-Fa-f]{2}[:]){5}([0-9A-Fa-f]{2})$')
-
-    if 'hosts' in config and config['hosts']:
-        variables = global_bmc_and_bios_configuration(config)
-
-        for host in config['hosts']:
-            if 'mac' in host:   # no mac -> no special configuration
-                host_variables = dict(variables)
-
-                # additional variables, may be more here
-                copy = ['name']
-                for name in copy:
-                    if name in host:
-                        host_variables[name] = host[name]
-
-                if 'bmc' in host:
-                    host_variables.update(host['bmc'])
-
-                if 'bios' in host:
-                    host_variables.update(host['bios'])
-
-                if 'bios' in profile:  # the profile is the most important as selected manually
-                    host_variables.update(profile['bios'])
-
-                host_variables = adapt_to_profile(host_variables)
-
-                # Saving file with host parameters (file name: provision_settings_{mac_address})
-                path = f"{profile_path}/files/seo/provision_settings_{host['mac'].lower()}"
-                seo.shell.create_variables_file(path, host_variables)
-
+# ---------------------------------------------
 
 def run_main(default_config_path=None, experience_kit_name=""):
     """ Top level script entry function """
-    root_path = os.path.dirname(os.path.realpath(__file__))
-
-    default_config_path = (
-        os.path.relpath(os.path.join(root_path, "default_config.yml"))
-        if default_config_path is None else default_config_path)
+    default_config_path = os.path.relpath(
+        os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "default_config.yml")) if default_config_path is None else default_config_path
 
     args = parse_args(default_config_path, experience_kit_name)
 
     try:
-        sys.exit(main(args, root_path, default_config_path).value)
-    except seo.error.AppException as e:
+        sys.exit(main(args, default_config_path).value)
+    except AppException as e:
         if args.debug:
             traceback.print_exc(file=sys.stderr)
         logging.error(e.code if e.msg is None else e.msg)
         sys.exit(e.code.value)
 
 
-def main(args, root_path, default_config_path):
+def main(args, default_config_path):
     """ Internal main function """
 
     if args.debug:
@@ -1184,28 +1076,24 @@ def main(args, root_path, default_config_path):
 
     logging.basicConfig(level=log_level, format=log_format, datefmt='%Y-%m-%d %H:%M:%S')
 
-    seo.stage.check_stages(args.start_from, STAGES)
+    check_stages(args.start_from)
 
     if args.init_config:
         init_config(default_config_path)
-        return seo.error.Codes.NO_ERROR
+        return Codes.NO_ERROR
 
-    cfg = seo.config.load_provisioning_cfg(args.config_file, root_path)
-
+    cfg = get_config(args.config_file)
+    validate_config(cfg)
     apply_args(cfg, args)
-
-    if args.stop_esp:
-        run_esp(cfg, args)
-        return seo.error.Codes.NO_ERROR
+    check_repositories(cfg, args)
+    check_preconditions()
 
     if args.force:
         cleanup(cfg)
 
-    if credentials_check_needed():
-        check_repositories(cfg, args)
-
-    if preconditions_check_needed():
-        check_preconditions(args)
+    if args.stop_esp:
+        run_esp(cfg, args)
+        return Codes.NO_ERROR
 
     clone_esp(cfg)
     configure_esp(cfg)
@@ -1227,9 +1115,7 @@ def main(args, root_path, default_config_path):
        args.run_esp_for_pxe_boot:
         run_esp(cfg, args)
 
-    print_profile_credentials(cfg)
-
-    return seo.error.Codes.NO_ERROR
+    return Codes.NO_ERROR
 
 
 if __name__ == "__main__":

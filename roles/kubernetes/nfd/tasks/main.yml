@@ -9,3 +9,4 @@
   when: "'controller_group' not in group_names"
 
 - include_tasks: nfd.yml
+  when: "'controller_group' in group_names"

@@ -1,0 +1,220 @@
+diff --git a/inventory.yml b/inventory.yml
+index eed1e2e..7404a8f 100644
+--- a/inventory.yml
++++ b/inventory.yml
+@@ -6,15 +6,15 @@ all:
+   vars:
+     cluster_name: dek_test        # NOTE: Use `_` instead of spaces.
+     deployment: dek               # NOTE: Available deployment type: Developer expirience kits (dek).
+-    single_node_deployment: true  # Request single node deployment (true/false).
++    single_node_deployment: false  # Request single node deployment (true/false).
+     limit:                        # Limit ansible deployment to certain inventory group or hosts
+ controller_group:
+   hosts:
+     controller:
+-      ansible_host: 172.16.0.1
++      ansible_host: 10.67.127.135
+       ansible_user: smartedge-open
+ edgenode_group:
+   hosts:
+     node01:
+-      ansible_host: 172.16.0.1
++      ansible_host: 10.67.127.26
+       ansible_user: smartedge-open
+diff --git a/inventory/default/group_vars/all/10-default.yml b/inventory/default/group_vars/all/10-default.yml
+index 4969025..4f36ccc 100644
+--- a/inventory/default/group_vars/all/10-default.yml
++++ b/inventory/default/group_vars/all/10-default.yml
+@@ -13,11 +13,11 @@
+ ### Proxy settings
+ proxy_env:
+   # Proxy URLs to be used for HTTP, HTTPS and FTP
+-  http_proxy: ""
+-  https_proxy: ""
+-  ftp_proxy: ""
++  http_proxy: "http://child-prc.intel.com:913"
++  https_proxy: "http://child-prc.intel.com:913"
++  ftp_proxy: "http://child-prc.intel.com:913"
+   # No proxy setting contains addresses and networks that should not be accessed using proxy (e.g. local network, Kubernetes CNI networks)
+-  no_proxy: ""
++  no_proxy: "*.intel.com,127.0.0.1,10.240.224.51,192.168.51.1,172.18.0.1,localhost,virt-api,.svc,.svc.cluster.local,cdi-api,127.0.0.1,10.96.0.0/12,10.32.0.0/12,10.32.0.0/12,172.32.1.0/12,10.245.0.0/16,10.67.115.240,10.67.115.43,10.67.127.26,NONE"
+ 
+ # Proxy for be used by GIT HTTP - required if GIT HTTP via proxy
+ git_http_proxy: "{{ proxy_env['http_proxy'] | default('') }}"
+@@ -64,10 +64,10 @@ kubernetes_cnis:
+ calico_cidr: "10.245.0.0/16"
+ 
+ ## SR-IOV Network Operator
+-sriov_network_operator_enable: true
++sriov_network_operator_enable: false
+ 
+ ## SR-IOV Network Operator configuration
+-sriov_network_operator_configure_enable: true
++sriov_network_operator_configure_enable: false
+ 
+ cvl_sriov_nics:
+   c0p0: "eno12399"
+@@ -154,7 +154,7 @@ sriov_networks:
+     link_state: enable
+  
+ ## Enable OOT driver installation for E810
+-e810_driver_enable: True
++e810_driver_enable: False
+ 
+ ### Kubernetes Topology Manager configuration (for worker)
+ # CPU settings
+@@ -186,6 +186,7 @@ ne_helm_charts_default_dir: "{{ project_dir }}/helm-charts"
+ 
+ ###############
+ ## Telemetry
++telemetry_enable: false
+ 
+ # Telemetry flavor - possible values: common (default), flexran, smartcity, corenetwork
+ telemetry_flavor: common
+diff --git a/roles/infrastructure/docker/tasks/install_debian.yml b/roles/infrastructure/docker/tasks/install_debian.yml
+index 1cbc070..1100f3a 100644
+--- a/roles/infrastructure/docker/tasks/install_debian.yml
++++ b/roles/infrastructure/docker/tasks/install_debian.yml
+@@ -12,12 +12,14 @@
+         state: directory
+         prefix: pip2-
+       register: pip2_temp_dir
+-    - name: download get-pip.py
+-      get_url:
+-        url: "https://bootstrap.pypa.io/pip/2.7/get-pip.py"
+-        dest: "{{ pip2_temp_dir.path }}"
++#    - name: download get-pip.py
++#      get_url:
++#        url: "https://bootstrap.pypa.io/pip/2.7/get-pip.py"
++        #dest: "{{ pip2_temp_dir.path }}"
++#        dest: "/tmp/pip2_temp_smartedge"
+     - name: install pip
+-      command: "python2 {{ pip2_temp_dir.path }}/get-pip.py"
++      #command: "python2 {{ pip2_temp_dir.path }}/get-pip.py"
++      command: "python2 /tmp/pip2_temp_smartedge/get-pip.py"
+       become: true
+     - name: change pip version
+       pip:
+diff --git a/roles/kubernetes/cni/multus/controlplane/tasks/multus.yml b/roles/kubernetes/cni/multus/controlplane/tasks/multus.yml
+index a10c664..d5f5946 100644
+--- a/roles/kubernetes/cni/multus/controlplane/tasks/multus.yml
++++ b/roles/kubernetes/cni/multus/controlplane/tasks/multus.yml
+@@ -12,7 +12,8 @@
+ - name: install Multus-cni chart
+   block:
+   - name: login harbor registry firstly
+-    command: docker login "{{ _registry_ip_address }}:{{ _registry_port }}" -uadmin -p{{ harbor_admin_password }}
++    #command: docker login "{{ _registry_ip_address }}:{{ _registry_port }}" -uadmin -p{{ harbor_admin_password }}
++    command: docker login "{{ _registry_ip_address }}:{{ _registry_port }}" -uadmin -pvha1bFmwYChE27sGgMxd
+     retries: 60
+     delay: 15
+     failed_when: false
+diff --git a/roles/kubernetes/harbor_registry/controlplane/tasks/main.yml b/roles/kubernetes/harbor_registry/controlplane/tasks/main.yml
+index ffaf201..4ac07a3 100644
+--- a/roles/kubernetes/harbor_registry/controlplane/tasks/main.yml
++++ b/roles/kubernetes/harbor_registry/controlplane/tasks/main.yml
+@@ -41,8 +41,8 @@
+ 
+     - name: generate admin password
+       set_fact:
+-        harbor_admin_password: "{{ lookup('password', '/dev/null chars=ascii_letters,digits') }}"
+-
++        #harbor_admin_password: "{{ lookup('password', '/dev/null chars=ascii_letters,digits') }}"
++        harbor_admin_password: "vha1bFmwYChE27sGgMxd"
+     - name: create namespace for harbor
+       command: kubectl create namespace harbor
+       failed_when: false
+@@ -58,7 +58,8 @@
+     - name: create Harbor admin secret
+       command: >
+         kubectl create secret -n harbor generic harbor-admin
+-        --from-literal=admin-password={{ harbor_admin_password }}
++        #--from-literal=admin-password={{ harbor_admin_password }}
++        --from-literal=admin-password=vha1bFmwYChE27sGgMxd
+       changed_when: true
+ 
+     - name: copy harbor helm chart values.j2 replace default values.yml
+@@ -119,7 +120,8 @@
+       register: harbor_password_cmd
+     - name: store admin password
+       set_fact:
+-        harbor_admin_password: "{{ harbor_password_cmd.stdout }}"
++        #harbor_admin_password: "{{ harbor_password_cmd.stdout }}"
++        harbor_admin_password: "vha1bFmwYChE27sGgMxd"
+   when: get_release_harbor.rc == 0
+ 
+ - name: update repositories cache
+diff --git a/roles/kubernetes/harbor_registry/node/tasks/main.yml b/roles/kubernetes/harbor_registry/node/tasks/main.yml
+index 767e39f..50bb9d0 100644
+--- a/roles/kubernetes/harbor_registry/node/tasks/main.yml
++++ b/roles/kubernetes/harbor_registry/node/tasks/main.yml
+@@ -34,7 +34,8 @@
+   become: true
+ 
+ - name: login harbor registry firstly
+-  command: docker login "{{ _registry_ip_address }}:{{ _registry_port }}" -uadmin -p{{ harbor_admin_password }}
++  #command: docker login "{{ _registry_ip_address }}:{{ _registry_port }}" -uadmin -p{{ harbor_admin_password }}
++  command: docker login "{{ _registry_ip_address }}:{{ _registry_port }}" -uadmin -pvha1bFmwYChE27sGgMxd
+   register: result
+   until: result is succeeded
+   retries: 60
+@@ -46,31 +47,32 @@
+   changed_when: true
+   become: true
+ 
+-- name: check whether the intel project is created
+-  shell: |
+-    curl --noproxy "*" -X GET \
+-    "https://{{ _registry_ip_address }}:{{ _registry_port }}/api/{{ harbor_api_version }}/projects?name=intel&public=true" \
+-    -H "accept: application/json" \
+-    -k --cacert /etc/docker/certs.d/{{ _registry_ip_address }}:{{ _registry_port }}/harbor.crt \
+-    -u "admin:{{ harbor_admin_password }}"
+-  register: intel_proj_is_created
+-  until: intel_proj_is_created is succeeded
+-  retries: 5
+-  delay: 5
+-  args:
+-    warn: false
+-  changed_when: false
++#- name: check whether the intel project is created
++#  shell: |
++#    curl --noproxy "*" -X GET \
++#    "https://{{ _registry_ip_address }}:{{ _registry_port }}/api/{{ harbor_api_version }}/projects?name=intel&public=true" \
++#    -H "accept: application/json" \
++#    -k --cacert /etc/docker/certs.d/{{ _registry_ip_address }}:{{ _registry_port }}/harbor.crt \
++    #-u "admin:{{ harbor_admin_password }}"
++#    -u "admin:vha1bFmwYChE27sGgMxd"
++#  register: intel_proj_is_created
++#  until: intel_proj_is_created is succeeded
++#  retries: 5
++#  delay: 5
++#  args:
++#    warn: false
++#  changed_when: false
+ 
+-- name: create a new harbor project named intel
+-  shell: |
+-    curl --noproxy "*" -X POST \
+-    "https://{{ _registry_ip_address }}:{{ _registry_port }}/api/{{ harbor_api_version }}/projects" \
+-    -H "accept: application/json" -H "Content-Type: application/json" \
+-    -d "{ \"project_name\": \"intel\", \"metadata\": { \"public\": \"true\" }, \"public\": true}" \
+-    -k --cacert "/etc/docker/certs.d/{{ _registry_ip_address }}:{{ _registry_port }}/harbor.crt" \
+-    -u "admin:{{ harbor_admin_password }}"
+-  register: create_result
+-  until: create_result.rc == 0
+-  when: intel_proj_is_created.stdout == '[]'
+-  args:
+-    warn: false
++#- name: create a new harbor project named intel
++#  shell: |
++#    curl --noproxy "*" -X POST \
++#    "https://{{ _registry_ip_address }}:{{ _registry_port }}/api/{{ harbor_api_version }}/projects" \
++#    -H "accept: application/json" -H "Content-Type: application/json" \
++#    -d "{ \"project_name\": \"intel\", \"metadata\": { \"public\": \"true\" }, \"public\": true}" \
++#    -k --cacert "/etc/docker/certs.d/{{ _registry_ip_address }}:{{ _registry_port }}/harbor.crt" \
++#    -u "admin:vha1bFmwYChE27sGgMxd"
++#  register: create_result
++#  until: create_result.rc == 0
++#  when: intel_proj_is_created.stdout == '[]'
++#  args:
++#    warn: false

@@ -30,9 +30,10 @@
     retries: "{{ number_of_retries }}"
     until: result is succeeded
     delay: "{{ retry_delay }}"
-  become: yes
+  become: true
   when:
     - ansible_os_family == "RedHat"
+    - not (offline_enable | default(false))
 
 - name: setup Debian K8s repository
   block:
@@ -40,7 +41,7 @@
     apt_key:
       url: "{{ item }}"
       state: present
-    loop: "{{ _kubernetes_repository_keys }}"
+    with_items: "{{ _kubernetes_repository_keys }}"
   - name: import K8s repository
     apt_repository:
       repo: "{{ _kubernetes_repository_url }}"
@@ -49,9 +50,10 @@
     retries: "{{ number_of_retries }}"
     until: result is succeeded
     delay: "{{ retry_delay }}"
-  become: yes
+  become: true
   when:
     - ansible_os_family == "Debian"
+    - not (offline_enable | default(false))
 
 - name: install packages
   package:
@@ -60,7 +62,7 @@
     skip_broken: "{{ true if ansible_os_family == 'RedHat' else omit }}"
     update_cache: true
     allow_downgrade: "{{ true if ansible_os_family == 'RedHat' else omit }}"
-  become: yes
+  become: true
   register: result
   retries: 20
   until: result is succeeded
@@ -89,7 +91,7 @@
     - name: refresh sysctl only if desired vars are disabled
       command: sysctl --system
       when: sysctl_out.rc == 0
-  become: yes
+  become: true
 
 - name: add etcd ports to list
   set_fact: 
@@ -108,9 +110,9 @@
 - name: setup kubectl bash completion
   shell: kubectl completion bash > /etc/bash_completion.d/kubectl
   changed_when: true
-  become: yes
+  become: true
 
 - name: setup kubeadm bash completion
   shell: kubeadm completion bash > /etc/bash_completion.d/kubeadm
   changed_when: true
-  become: yes
+  become: true

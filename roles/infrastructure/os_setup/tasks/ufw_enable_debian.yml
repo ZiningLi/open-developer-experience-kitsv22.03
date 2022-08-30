@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2021-2022 Intel Corporation
+# Copyright (c) 2021 Intel Corporation
 
 ---
 - name: open ssh port
-  include_role:
-    name: infrastructure/firewall_open_ports
-  vars:
-    fw_open_ports:
-      - "22/tcp"
+  ufw:
+    rule: allow
+    port: 22
+    proto: tcp
+  become: true
 
 - name: enable UFW
   ufw:
     state: enabled
-  become: yes
+  become: true
   notify:
     - reboot server

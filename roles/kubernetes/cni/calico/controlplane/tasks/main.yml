@@ -9,8 +9,8 @@
   file:
     name: /etc/NetworkManager/conf.d
     state: directory
-    mode: a=rx,u+w
-  become: yes
+    mode: 0777
+  become: true
 
 - name: add NetworkManager config - ignore calico's interfaces
   copy:
@@ -19,7 +19,7 @@
     content: |
       [keyfile]
       unmanaged-devices=interface-name:cali*;interface-name:tunl*
-  become: yes
+  become: true
 
 - name: create temp dir
   tempfile:
@@ -29,7 +29,7 @@
 
 - name: download calico yml
   get_url:
-    url: "{{ _calico_url }}"
+    url: "{{ 'https://' + hostvars[groups['controller_group'][0]]['ansible_host'] + '/' + _calico_manifest if (offline_enable | default(false)) else _calico_url }}"
     dest: "{{ tmp_dir.path }}/calico.yml"
   register: result
   retries: "{{ number_of_retries }}"
@@ -41,7 +41,7 @@
     src: "{{ item }}"
     dest: "{{ tmp_dir.path }}"
     mode: preserve
-  loop:
+  with_items:
     - kustomization.yml
     - customize_calico_container.yml
 
@@ -57,7 +57,7 @@
     src: "{{ item }}.j2"
     dest: "{{ tmp_dir.path }}/{{ item }}"
     mode: preserve
-  loop:
+  with_items:
     - customize_calico_conf.yml
     - change_cidr.yml
 

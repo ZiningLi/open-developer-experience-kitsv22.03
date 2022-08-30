@@ -3,7 +3,7 @@
 
 ---
 - name: prepare directory tree
-  become: yes
+  become: true
   block:
     - name: add group "{{ project_group }}"
       group:
@@ -14,7 +14,7 @@
       file:
         path: "{{ project_dir }}"
         state: directory
-        mode: a=rx,u+w
+        mode: 0777
         owner: "{{ ansible_user }}"
         group: "{{ project_group }}"
 
@@ -22,41 +22,51 @@
       file:
         path: "{{ item }}"
         state: directory
-        mode: a=rx,u+w
+        mode: 0777
         owner: "{{ ansible_user }}"
         group: "{{ project_group }}"
-      loop:
+      with_items:
         - "{{ project_dir }}/certs"
+        - "{{ project_dir }}/certs/telemetry"
         - "{{ project_dir }}/configs"
         - "{{ project_dir }}/scripts"
+
+    - name: create collectd certificate directory
+      file:
+        path: "{{ project_dir }}/certs/telemetry/collectd"
+        state: directory
+        mode: 0777
+        owner: "{{ ansible_user }}"
+        group: "{{ project_group }}"
+      when: "telemetry_collectd_enable | default(True)"
+
+    - name: create collectd config directory
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: 0777
+        owner: "{{ ansible_user }}"
+        group: "{{ project_group }}"
+      with_items:
+        - "{{ project_dir }}/collectd"
+        - "{{ project_dir }}/collectd/configs"
+        - "{{ project_dir }}/collectd/pmd"
+      when: "telemetry_collectd_enable | default(True)"
 
     - name: create edgednssvr directory
       file:
         path: "{{ project_dir }}/edgednssvr"
         state: directory
-        mode: a=rx,u+w
+        mode: 0777
         owner: "{{ ansible_user }}"
         group: "{{ project_group }}"
-      when: dns_enable | default(false)
-
-    - name: create edgedns directory
-      file:
-        path: "{{ item }}"
-        state: directory
-        mode: a=rx,u+w
-        owner: "{{ ansible_user }}"
-        group: "{{ project_group }}"
-      loop:
-        - "{{ project_dir }}/edgedns"
-        - "{{ project_dir }}/edgedns/configs"
-        - "{{ project_dir }}/edgedns/certs"
       when: dns_enable | default(false)
 
     - name: create pv grafana directory
       file:
         path: "{{ _persistent_volumes_dest }}/grafana"
         state: directory
-        mode: a=rx,u+w
+        mode: 0777
         owner: "{{ ansible_user }}"
         group: "{{ project_group }}"
       when: telemetry_grafana_enable | default(True)
@@ -65,7 +75,7 @@
       file:
         path: "{{ _persistent_volumes_dest }}/prometheus"
         state: directory
-        mode: a=rx,u+w
+        mode: 0777
         owner: "{{ ansible_user }}"
         group: "{{ project_group }}"
       when: telemetry_prometheus_enable | default(True)

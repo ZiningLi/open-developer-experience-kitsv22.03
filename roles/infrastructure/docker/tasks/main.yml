@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2019-2022 Intel Corporation
+# Copyright (c) 2019-2021 Intel Corporation
 
 ---
 
@@ -19,6 +19,10 @@
 - name: reset connection
   meta: reset_connection
 
+- name: update runc version
+  include_tasks: update_runc.yml
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == '7'
+
 - name: install pip dependencies
   include_tasks: install_pip_dep.yml
 
@@ -34,7 +38,7 @@
       file:
         path: /etc/docker/
         state: directory
-        mode: a=rx,u+w
+        mode: 0777
     - name: Generate daemon.json
       template:
         src: daemon.json.j2
@@ -42,10 +46,14 @@
         mode: preserve
       notify:
         - enable and start docker service
-  become: yes
+  become: true
 
 - name: restart services if needed
   meta: flush_handlers
 
 - name: set audit rules for docker
   include_tasks: audit.yml
+
+- name: download and load offline docker images
+  include_tasks: offline_images.yml
+  when: offline_enable | default(False)
